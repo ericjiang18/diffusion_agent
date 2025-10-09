@@ -1,11 +1,10 @@
 from abc import ABC, abstractmethod
 from typing import List, Union, Optional
-
-from GDesigner.llm.format import Message
+from .format import Message
 
 
 class LLM(ABC):
-    DEFAULT_MAX_TOKENS = 1000
+    DEFAULT_MAX_TOKENS = 1024
     DEFAULT_TEMPERATURE = 0.2
     DEFUALT_NUM_COMPLETIONS = 1
 

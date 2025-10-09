@@ -1,4 +1,4 @@
-from GDesigner.utils.globals import Cost, PromptTokens, CompletionTokens
+from ..utils.globals import Cost, PromptTokens, CompletionTokens
 import tiktoken
 # GPT-4:  https://platform.openai.com/docs/models/gpt-4-and-gpt-4-turbo
 # GPT3.5: https://platform.openai.com/docs/models/gpt-3-5
@@ -95,6 +95,12 @@ OPENAI_MODEL_INFO ={
             "output": 0.12
         },
         "gpt-4o": {
+            "context window": 128000, 
+            "training": "Jan 2024", 
+            "input": 0.005, 
+            "output": 0.015
+        }, 
+        "gpt-4o-mini": {
             "context window": 128000, 
             "training": "Jan 2024", 
             "input": 0.005, 

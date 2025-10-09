@@ -8,6 +8,9 @@ class Message:
     role: MessageRole
     content: str
 
+    def to_dict(self):
+        return dataclasses.asdict(self)
+
 @dataclasses.dataclass
 class Status:
     started: int = 0
