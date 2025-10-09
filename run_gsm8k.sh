@@ -14,7 +14,7 @@ set -x
 
 # --- Configuration ---
 # Adjust these variables as needed
-LLM_NAME="gpt-4o"
+LLM_NAME=gpt-4o-mini
 DOMAIN="gsm8k"
 AGENT_NAMES="MathSolver"
 AGENT_NUMS=4
