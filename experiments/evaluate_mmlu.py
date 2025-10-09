@@ -6,10 +6,13 @@ import asyncio
 from typing import Union,Literal,Optional,Iterator,List,Any,Dict
 from tqdm import tqdm
 import copy
-
-from GDesigner.graph.graph import Graph
-from experiments.accuracy import Accuracy
-from GDesigner.utils.globals import Cost, PromptTokens, CompletionTokens
+import torch
+from torch.utils.data import DataLoader, TensorDataset
+from agent_diffusion.GDesigner.graph.graph import Graph
+from torch.optim import Adam
+import torch.nn as nn
+from agent_diffusion.GDesigner.utils.globals import Cost, PromptTokens, CompletionTokens
+from agent_diffusion.experiments.accuracy import Accuracy
 
 async def evaluate(
         graph:Graph,

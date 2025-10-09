@@ -142,6 +142,18 @@ async def generate_initial_dataset(args, dataset):
             raw_answer, _ = await gdesigner_graph.arun({"task": task_prompt}, args.num_rounds)
             
             predicted_code = humaneval_get_predict(raw_answer[0])
+            print("="*80)
+            print("GTD PROBLEM DEBUG:")
+            print("="*80)
+            print("RAW MODEL RESPONSE:")
+            print(repr(raw_answer[0]))
+            print("\nEXTRACTED CODE:")
+            print(repr(predicted_code))
+            print("\nTASK PROMPT:")
+            print(repr(task_prompt[:200]))
+            print("\nTEST CODE:")
+            print(repr(test_code[:200]))
+            print("="*80)
             score, _ = check_correctness(task_prompt, predicted_code, test_code)
             utility = score
             cost = sum(sum(row) for row in topology_matrix)
@@ -346,6 +358,18 @@ async def run_gtd_experiment(args, dataset):
             raw_answer, _ = await gdesigner_graph.arun(input_dict, args.num_rounds)
             
             predicted_code = humaneval_get_predict(raw_answer[0])
+            print("="*80)
+            print("GTD PROBLEM DEBUG:")
+            print("="*80)
+            print("RAW MODEL RESPONSE:")
+            print(repr(raw_answer[0]))
+            print("\nEXTRACTED CODE:")
+            print(repr(predicted_code))
+            print("\nTASK PROMPT:")
+            print(repr(task_prompt[:200]))
+            print("\nTEST CODE:")
+            print(repr(test_code[:200]))
+            print("="*80)
             score, result_str = check_correctness(task_prompt, predicted_code, test_code)
             
             total_solved += score

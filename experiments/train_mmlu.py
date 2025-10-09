@@ -6,10 +6,12 @@ import time
 import asyncio
 from typing import List
 import copy
-
-from GDesigner.graph.graph import Graph
-from experiments.accuracy import Accuracy
-from GDesigner.utils.globals import Cost, PromptTokens, CompletionTokens
+from torch.utils.data import DataLoader, TensorDataset
+from agent_diffusion.GDesigner.graph.graph import Graph
+from torch.optim import Adam
+import torch.nn as nn
+from agent_diffusion.GDesigner.utils.globals import Cost, PromptTokens, CompletionTokens
+from agent_diffusion.experiments.accuracy import Accuracy
 
 async def train(graph:Graph,
             dataset,

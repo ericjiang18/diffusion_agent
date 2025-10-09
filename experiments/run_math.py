@@ -1,11 +1,14 @@
 import sys
 import os
 import argparse
+import yaml
 import json
 import time
 import asyncio
 from pathlib import Path
 import torch
+import copy
+from typing import List,Union,Literal
 import random
 # The following line is no longer necessary after installing with setup.py
 # sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
@@ -15,8 +18,9 @@ from GDesigner.utils.const import GDesigner_ROOT
 from GDesigner.graph.graph import Graph
 from GDesigner.tools.reader.readers import JSONLReader
 import GDesigner.agents  # Import to register all agent classes
-from GDesigner.utils.globals import Time, Cost
-from datasets.mmlu_dataset import mmlu_data_process, mmlu_get_predict, mmlu_check_correctness
+from GDesigner.utils.globals import Time
+from GDesigner.utils.globals import Cost
+from datasets.math_dataset import math_data_process, math_get_predict, math_check_correctness
 
 from GDesigner.gdt.gtd_framework import GTDFramework
 from GDesigner.gdt.proxy_reward_model import ProxyRewardModel
@@ -31,21 +35,24 @@ def load_result(result_file):
     if not result_file.exists():
         with open(result_file, 'w',encoding='utf-8') as file:
             json.dump([], file)
-    return json.load(open(result_file, 'r',encoding='utf-8'))
+
+    with open(result_file, 'r',encoding='utf-8') as file:
+        data = json.load(file)
+    return data
 
 def dataloader(data_list, batch_size, i_batch):
     return data_list[i_batch*batch_size:i_batch*batch_size + batch_size]
-
+    
 def parse_args():
-    parser = argparse.ArgumentParser(description="GDesigner Experiments on MMLU")
-    parser.add_argument("--dataset_json", type=str, default="datasets/MMLU/mmlu.jsonl")
+    parser = argparse.ArgumentParser(description="GDesigner Experiments on MATH")
+    parser.add_argument("--dataset_json", type=str, default="datasets/MATH/test500.jsonl")
     parser.add_argument("--llm_name", type=str, default="gpt-4o")
     parser.add_argument('--mode', type=str, default='GTD', choices=['GTD'])
     parser.add_argument('--batch_size', type=int, default=2)
     parser.add_argument('--num_rounds',type=int,default=1)
-    parser.add_argument('--domain', type=str, default="mmlu")
-    parser.add_argument('--agent_names', nargs='+', type=str, default=['KnowledgeableAcademic', 'LogicalDeductionMaster', 'CriticalThinker'])
-    parser.add_argument('--agent_nums', nargs='+', type=int, default=[1, 1, 1])
+    parser.add_argument('--domain', type=str, default="math")
+    parser.add_argument('--agent_names', nargs='+', type=str, default=['MathSolver'])
+    parser.add_argument('--agent_nums', nargs='+', type=int, default=[4])
     parser.add_argument('--decision_method', type=str, default='FinalRefer')
     
     gtd_group = parser.add_argument_group('GTD Mode Options')
@@ -60,9 +67,9 @@ def parse_args():
     gtd_group.add_argument('--gtd-generate-data', action='store_true')
     gtd_group.add_argument('--gtd-train-models', action='store_true')
     gtd_group.add_argument('--gtd-datagen-limit', type=int, default=50)
-    gtd_group.add_argument('--gtd-dataset-path', type=str, default='gtd_mmlu_dataset.jsonl')
-    gtd_group.add_argument('--gtd-proxy-model-path', type=str, default='proxy_model_mmlu.pth')
-    gtd_group.add_argument('--gtd-diffusion-model-path', type=str, default='diffusion_model_mmlu.pth')
+    gtd_group.add_argument('--gtd-dataset-path', type=str, default='gtd_math_dataset.jsonl')
+    gtd_group.add_argument('--gtd-proxy-model-path', type=str, default='proxy_model_math.pth')
+    gtd_group.add_argument('--gtd-diffusion-model-path', type=str, default='diffusion_model_math.pth')
     gtd_group.add_argument('--gtd-epochs', type=int, default=10)
     
     # Add missing GNN/MLP hyperparameter arguments
@@ -79,12 +86,13 @@ def parse_args():
     return args
 
 async def generate_initial_dataset(args, dataset):
+    print("--- Starting Phase 1: Initial Dataset Generation for MATH---")
     agent_names_list = [name for name, num in zip(args.agent_names, args.agent_nums) for _ in range(num)]
     num_nodes = len(agent_names_list)
-    prompt_set = PromptSetRegistry.get(args.domain)
+    prompt_set = PromptSetRegistry.get("gsm8k") # Reuse gsm8k prompts
     agent_profiles = [prompt_set.get_description(name) for name in agent_names_list]
     node_features_base = [get_sentence_embedding(p) for p in agent_profiles]
-    
+
     def generate_static_topologies(n):
         topologies = {
             'fully_connected': [[1 if i != j else 0 for j in range(n)] for i in range(n)],
@@ -94,42 +102,62 @@ async def generate_initial_dataset(args, dataset):
         for i in range(3):
             topologies[f'random_{i}'] = [[random.randint(0, 1) if i != j else 0 for j in range(n)] for i in range(n)]
         return topologies
+
     static_topologies = generate_static_topologies(num_nodes)
-    
     generated_data = []
+    proxy_data_list = []
+
     for i, record in enumerate(dataset):
-        if i >= args.gtd_datagen_limit: break
-        task_query, true_answer, choices = record["task"], record["answer"], record["choices"]
+        if i >= args.gtd_datagen_limit:
+            break
+        
+        task_query = record["task"]
+        true_answer = record["answer"]
         task_condition_embedding = get_sentence_embedding(task_query)
+        print(f"\nProcessing record {i}: {task_query[:60]}...")
 
         for name, topology_matrix in static_topologies.items():
-            gdesigner_graph = Graph(args.domain, args.llm_name, agent_names_list, args.decision_method, fixed_spatial_masks=topology_matrix)
+            print(f"  Testing topology: {name}")
+            gdesigner_graph = Graph(
+                domain="gsm8k", llm_name=args.llm_name, agent_names=agent_names_list,
+                decision_method=args.decision_method, fixed_spatial_masks=topology_matrix
+            )
             raw_answer, _ = await gdesigner_graph.arun({"task": task_query}, args.num_rounds)
             
-            predict_index = mmlu_get_predict(raw_answer[0], choices); print(f"Model response: {raw_answer[0]}"); print(f"Predicted index: {predict_index}"); print(f"True answer: {true_answer}"); print(f"Comparison result: {predict_index == true_answer}"); print("---")
-            utility = 1.0 if predict_index == true_answer else 0.0
+            predict_answer = math_get_predict(raw_answer[0])
+            is_solved = math_check_correctness(predict_answer, true_answer)
+            utility = 1.0 if is_solved else 0.0
             cost = sum(sum(row) for row in topology_matrix)
             
-            generated_data.append({
-                'graph': topology_matrix, 'condition': task_condition_embedding.tolist(),
-                'node_features': [feat.tolist() for feat in node_features_base],
-                'performance': {'utility': utility, 'cost': cost}
-            })
+            adj_matrix = torch.tensor(topology_matrix, dtype=torch.float)
+            edge_index, _ = dense_to_sparse(adj_matrix)
+            proxy_data_list.append(Data(
+                x=torch.tensor(node_features_base, dtype=torch.float), 
+                edge_index=edge_index, 
+                condition=torch.tensor(task_condition_embedding, dtype=torch.float).unsqueeze(0), 
+                true_rewards=torch.tensor([utility, cost], dtype=torch.float).unsqueeze(0)
+            ))
+            
+            generated_data.append({'graph': topology_matrix, 'condition': task_condition_embedding.tolist(), 'node_features': [f.tolist() for f in node_features_base], 'performance': {'utility': utility, 'cost': cost}})
 
     with open(args.gtd_dataset_path, 'w') as f:
         for item in generated_data:
             f.write(json.dumps(item) + '\n')
+    print(f"\n--- Phase 1 Finished: Saved {len(generated_data)} data points to {args.gtd_dataset_path} ---")
 
 async def train_gtd_models(args):
+    print(f"--- Starting Phase 2: Training GTD Models from {args.gtd_dataset_path} ---")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     proxy_data_list, diffusion_A0_list, diffusion_nodes_list, diffusion_cond_list = [], [], [], []
     with open(args.gtd_dataset_path, 'r') as f:
         for line in f:
             item = json.loads(line)
+            adj_matrix = torch.tensor(item['graph'], dtype=torch.float)
+            edge_index, _ = dense_to_sparse(adj_matrix)
             rewards = item['performance']
             proxy_data_list.append(Data(
-                x=torch.tensor(item['node_features'], dtype=torch.float), 
-                edge_index=dense_to_sparse(torch.tensor(item['graph'], dtype=torch.float))[0],
+                x=torch.tensor(item['node_features'], dtype=torch.float), edge_index=edge_index,
                 condition=torch.tensor(item['condition'], dtype=torch.float).unsqueeze(0),
                 true_rewards=torch.tensor([rewards['utility'], rewards['cost']], dtype=torch.float).unsqueeze(0)
             ))
@@ -151,19 +179,23 @@ async def train_gtd_models(args):
         mlp_hidden_dim=args.mlp_hidden_dim,
         num_reward_components=2
     ).to(device)
+    pyg_dataloader = PyGDataLoader(proxy_data_list, batch_size=16, shuffle=True)
     optimizer = torch.optim.Adam(proxy_model.parameters(), lr=1e-3)
     criterion = torch.nn.MSELoss()
+
+    print("\n--- Training Proxy Reward Model ---")
     proxy_model.train()
-    for _ in range(args.gtd_epochs):
-        for batch in PyGDataLoader(proxy_data_list, batch_size=16, shuffle=True):
+    for epoch in range(args.gtd_epochs):
+        for batch in pyg_dataloader:
             batch = batch.to(device)
             optimizer.zero_grad()
-            loss = criterion(proxy_model(batch), batch.true_rewards)
+            pred_rewards = proxy_model(batch)
+            loss = criterion(pred_rewards, batch.true_rewards)
             loss.backward()
             optimizer.step()
     torch.save(proxy_model.state_dict(), args.gtd_proxy_model_path)
 
-    gtd_framework = GTDFramework(
+    diffusion_model = GTDFramework(
         task_cond_input_dim=args.gtd_task_cond_input_dim,
         node_feature_dim=args.gtd_node_feat_dim,
         condition_dim=args.gtd_cond_dim,
@@ -183,16 +215,18 @@ async def train_gtd_models(args):
                 diffusion_cond_list.append(item['condition'])
     
     if diffusion_A0_list:  # Only train if we have any data at all
-        gtd_framework.train_diffusion_model(
-            dataloader=DataLoader(TensorDataset(
-                torch.tensor(diffusion_A0_list, dtype=torch.float),
-                torch.tensor(diffusion_nodes_list, dtype=torch.float),
-                torch.tensor(diffusion_cond_list, dtype=torch.float)
-            ), batch_size=16, shuffle=True),
-            epochs=args.gtd_epochs
+        diffusion_dataset = TensorDataset(
+            torch.tensor(diffusion_A0_list, dtype=torch.float),
+            torch.tensor(diffusion_nodes_list, dtype=torch.float),
+            torch.tensor(diffusion_cond_list, dtype=torch.float)
         )
+        diffusion_dataloader = DataLoader(diffusion_dataset, batch_size=16, shuffle=True)
+        
+        print("\n--- Training Diffusion Model ---")
+        diffusion_model.train_diffusion_model(dataloader=diffusion_dataloader, epochs=args.gtd_epochs, learning_rate=1e-4)
     
-    torch.save(gtd_framework.diffusion_model.state_dict(), args.gtd_diffusion_model_path)
+    torch.save(diffusion_model.diffusion_model.state_dict(), args.gtd_diffusion_model_path)
+    print("--- Phase 2 Finished ---")
 
 async def run_gtd_experiment(args, dataset):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -227,39 +261,43 @@ async def run_gtd_experiment(args, dataset):
     gtd_framework.diffusion_model.load_state_dict(torch.load(args.gtd_diffusion_model_path))
     gtd_framework.diffusion_model.to(device).eval()
 
-    prompt_set = PromptSetRegistry.get(args.domain)
+    prompt_set = PromptSetRegistry.get("gsm8k")
     agent_profiles = [prompt_set.get_description(name) for name in agent_names_list]
     node_features_base = torch.tensor([get_sentence_embedding(p) for p in agent_profiles]).float().to(device)
 
-    result_file = Path(GDesigner_ROOT, "result", f"gtd_{args.domain}", f"{args.llm_name}_{time.strftime('%Y%m%d-%H%M%S')}.json")
-    result_file.parent.mkdir(parents=True, exist_ok=True)
+    result_dir = Path(f"{GDesigner_ROOT}/result/gtd_{args.domain}")
+    result_dir.mkdir(parents=True, exist_ok=True)
+    result_file = result_dir / f"{args.llm_name}_{time.strftime('%Y%m%d-%H%M%S')}.json"
 
     total_solved, total_executed = 0, 0
     for record in dataset:
-        task_query, true_answer, choices = record["task"], record["answer"], record["choices"]
+        task_query, true_answer = record["task"], record["answer"]
         task_condition = torch.tensor(get_sentence_embedding(task_query)).float().unsqueeze(0).to(device)
+
         adj_matrix = (gtd_framework.generate_graphs(1, num_nodes, node_features_base.unsqueeze(0), task_condition, True).squeeze(0) > 0.5).int()
 
         gdesigner_graph = Graph(
-            domain=args.domain, llm_name=args.llm_name, agent_names=agent_names_list,
+            domain="gsm8k", llm_name=args.llm_name, agent_names=agent_names_list,
             decision_method=args.decision_method, fixed_spatial_masks=adj_matrix.tolist()
         )
         raw_answer, _ = await gdesigner_graph.arun({"task": task_query}, args.num_rounds)
         
-        predict_index = mmlu_get_predict(raw_answer[0], choices); print(f"Model response: {raw_answer[0]}"); print(f"Predicted index: {predict_index}"); print(f"True answer: {true_answer}"); print(f"Comparison result: {predict_index == true_answer}"); print("---")
-        is_solved = predict_index == true_answer
+        predict_answer = math_get_predict(raw_answer[0])
+        is_solved = predict_answer.strip() == true_answer.strip()
         total_solved += is_solved
         total_executed += 1
         
+        # Log results
         data = load_result(result_file)
         data.append({"Question": task_query, "Solved": is_solved, "Accuracy": total_solved/total_executed})
-        with open(result_file, 'w') as f: json.dump(data, f, indent=4)
+        with open(result_file, 'w') as f:
+            json.dump(data, f, indent=4)
         print(f"Accuracy: {total_solved/total_executed:.3f}")
 
 async def main():
     args = parse_args()
     dataset = JSONLReader.parse_file(args.dataset_json)
-    dataset = mmlu_data_process(dataset)
+    dataset = math_data_process(dataset)
     
     if args.gtd_generate_data:
         await generate_initial_dataset(args, dataset)

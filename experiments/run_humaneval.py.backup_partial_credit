@@ -1,0 +1,343 @@
+import asyncio
+import argparse
+import json
+import os
+import sys
+import time
+import torch
+import numpy as np
+from typing import Dict, List, Any
+from torch_geometric.data import Data, DataLoader as PyGDataLoader
+from torch.utils.data import DataLoader, TensorDataset
+
+# Add the project root to the Python path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import GDesigner.agents  # Import to register all agent classes
+from GDesigner.utils.globals import Time
+from GDesigner.utils.globals import Cost, PromptTokens, CompletionTokens
+from datasets.humaneval_dataset import humaneval_data_process, humaneval_get_predict, check_correctness
+
+from GDesigner.gdt.gtd_framework import GTDFramework
+from GDesigner.gdt.proxy_reward_model import ProxyRewardModel
+from GDesigner.llm.profile_embedding import get_sentence_embedding
+from GDesigner.prompt.prompt_set_registry import PromptSetRegistry
+from torch.utils.data import DataLoader, TensorDataset
+
+from torch_geometric.utils import dense_to_sparse
+
+from GDesigner.gdt.gtd_framework import GTDFramework
+from GDesigner.gdt.proxy_reward_model import ProxyRewardModel
+from GDesigner.llm.profile_embedding import get_sentence_embedding
+from GDesigner.prompt.prompt_set_registry import PromptSetRegistry
+from torch.utils.data import DataLoader, TensorDataset
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Run HumanEval experiments with GTD framework')
+    
+    # Basic arguments
+    parser.add_argument('--mode', type=str, choices=['baseline', 'gtd'], default='gtd',
+                        help='Experiment mode: baseline or gtd')
+    parser.add_argument('--num_rounds', type=int, default=3, help='Number of rounds for agent interaction')
+    parser.add_argument('--output_file', type=str, default='result/gtd_humaneval/gpt-4o-mini_results.json',
+                        help='Output file for results')
+    
+    # GTD-specific arguments
+    gtd_group = parser.add_argument_group('GTD Framework Arguments')
+    gtd_group.add_argument('--gtd_epochs', type=int, default=10, help='Number of training epochs')
+    gtd_group.add_argument('--gtd_layers', type=int, default=2, help='Number of layers in the Graph Transformer')
+    gtd_group.add_argument('--gtd_heads', type=int, default=2, help='Number of attention heads in the Graph Transformer')
+    gtd_group.add_argument('--gtd_diffusion_steps', type=int, default=50)
+    gtd_group.add_argument('--gtd_candidates', type=int, default=5)
+    gtd_group.add_argument('--gtd-generate-data', action='store_true')
+    gtd_group.add_argument('--gtd-train-models', action='store_true')
+    gtd_group.add_argument('--gtd-datagen-limit', type=int, default=50)
+    gtd_group.add_argument('--gtd-dataset-path', type=str, default='gtd_humaneval_dataset.jsonl')
+    gtd_group.add_argument('--gtd-proxy-model-path', type=str, default='proxy_model_humaneval.pth')
+    gtd_group.add_argument('--gtd-diffusion-model-path', type=str, default='diffusion_model_humaneval.pth')
+    
+    # Add missing GNN/MLP hyperparameter arguments
+    parser.add_argument('--gnn_hidden_dim', type=int, default=32)
+    parser.add_argument('--gnn_layers', type=int, default=2)
+    parser.add_argument('--mlp_hidden_dim', type=int, default=64)
+    parser.add_argument('--gt_num_layers', type=int, default=2)
+    parser.add_argument('--gt_num_heads', type=int, default=2)
+    
+    return parser.parse_args()
+
+async def generate_initial_dataset(args, dataset):
+    """PHASE 1: Generate initial dataset for GTD training with partial credit scoring."""
+    print(f"--- Starting Phase 1: Generating GTD Dataset with Partial Credit Scoring ---")
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    generated_data = []
+    
+    # Limit dataset for initial generation
+    limited_dataset = dataset[:args.gtd_datagen_limit]
+    
+    for i, item in enumerate(limited_dataset):
+        print(f"Generating data point {i+1}/{len(limited_dataset)}")
+        
+        task_prompt = item["task"]
+        test_code = item["test"]
+        
+        # Create a simple graph for initial data generation
+        num_nodes = 3
+        topology_matrix = np.ones((num_nodes, num_nodes))  # Fully connected
+        
+        # Get node features (agent profiles)
+        agent_names = ['Project_Manager', 'Algorithm_Designer', 'Programming_Expert']
+        node_features = []
+        for agent_name in agent_names:
+            try:
+                profile_embedding = get_sentence_embedding(f"You are a {agent_name.lower().replace('_', ' ')}")
+                node_features.append(profile_embedding)
+            except:
+                # Fallback to random features if embedding fails
+                node_features.append(np.random.randn(384))
+        
+        # Run the graph to get a response
+        from GDesigner.graph.graph import Graph
+        gdesigner_graph = Graph(topology_matrix, agent_names)
+        
+        try:
+            raw_answer, _ = await gdesigner_graph.arun({"task": task_prompt}, args.num_rounds)
+            
+            predicted_code = humaneval_get_predict(raw_answer[0])
+            # Use partial credit scoring instead of binary
+            score, result_str = check_correctness(task_prompt, predicted_code, test_code)
+            utility = score  # Use the decimal score directly
+            cost = sum(sum(row) for row in topology_matrix)
+            
+            print(f"Problem {i+1}: Score = {score:.3f}, Utility = {utility:.3f}")
+            
+        except Exception as e:
+            print(f"Error in problem {i+1}: {e}")
+            utility = 0.0
+            cost = sum(sum(row) for row in topology_matrix)
+            raw_answer = ["Error occurred"]
+        
+        # Store the data point
+        data_point = {
+            "graph": topology_matrix.tolist(),
+            "node_features": node_features,
+            "condition": get_sentence_embedding(task_prompt).tolist(),
+            "performance": {
+                "utility": utility,
+                "cost": cost
+            },
+            "response": raw_answer[0] if raw_answer else "No response",
+            "task": task_prompt,
+            "test": test_code
+        }
+        generated_data.append(data_point)
+    
+    # Save the generated dataset
+    os.makedirs(os.path.dirname(args.gtd_dataset_path), exist_ok=True)
+    with open(args.gtd_dataset_path, 'w') as f:
+        for item in generated_data:
+            f.write(json.dumps(item) + '\n')
+    
+    print(f"\n--- Phase 1 Finished: Saved {len(generated_data)} data points to {args.gtd_dataset_path} ---")
+    print(f"Average utility (partial credit): {np.mean([item['performance']['utility'] for item in generated_data]):.3f}")
+
+async def train_gtd_models(args):
+    """PHASE 2: Train the Proxy and Diffusion models from the generated dataset."""
+    print(f"--- Starting Phase 2: Training GTD Models with Partial Credit from {args.gtd_dataset_path} ---")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Load the generated dataset
+    proxy_data_list, diffusion_A0_list, diffusion_nodes_list, diffusion_cond_list = [], [], [], []
+    with open(args.gtd_dataset_path, 'r') as f:
+        for line in f:
+            item = json.loads(line.strip())
+            
+            # For Proxy Model
+            adj_matrix = torch.tensor(item['graph'], dtype=torch.float)
+            edge_index, _ = dense_to_sparse(adj_matrix)
+            rewards = item['performance']
+            proxy_data_item = Data(
+                x=torch.tensor(item['node_features'], dtype=torch.float),
+                edge_index=edge_index,
+                condition=torch.tensor(item['condition'], dtype=torch.float).unsqueeze(0),
+                true_rewards=torch.tensor([rewards['utility'], rewards['cost']], dtype=torch.float).unsqueeze(0)
+            )
+            proxy_data_list.append(proxy_data_item)
+            
+            # For Diffusion Model (use partial credit threshold instead of binary)
+            if rewards['utility'] >= 0.1:  # Lower threshold to include partial successes
+                diffusion_A0_list.append(item['graph'])
+                diffusion_nodes_list.append(item['node_features'])
+                diffusion_cond_list.append(item['condition'])
+    
+    print(f"Training with {len(proxy_data_list)} proxy data points")
+    print(f"Training with {len(diffusion_A0_list)} diffusion data points (partial credit >= 0.1)")
+    
+    # 1. Train Proxy Model
+    proxy_model = ProxyRewardModel(
+        input_dim=384,
+        gnn_hidden_dim=args.gnn_hidden_dim,
+        gnn_layers=args.gnn_layers,
+        mlp_hidden_dim=args.mlp_hidden_dim,
+        num_reward_components=2
+    ).to(device)
+    
+    pyg_dataloader = PyGDataLoader(proxy_data_list, batch_size=16, shuffle=True)
+    optimizer = torch.optim.Adam(proxy_model.parameters(), lr=1e-3)
+    criterion = torch.nn.MSELoss()
+    
+    print("\n--- Training Proxy Model with Partial Credit ---")
+    for epoch in range(args.gtd_epochs):
+        total_loss = 0
+        for batch in pyg_dataloader:
+            batch = batch.to(device)
+            optimizer.zero_grad()
+            pred_rewards = proxy_model(batch)
+            loss = criterion(pred_rewards, batch.true_rewards)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        print(f"Epoch {epoch+1}/{args.gtd_epochs}, Proxy Model Loss: {total_loss / len(pyg_dataloader):.4f}")
+    
+    torch.save(proxy_model.state_dict(), args.gtd_proxy_model_path)
+    print(f"--- Saved trained Proxy Model to {args.gtd_proxy_model_path} ---")
+    
+    # 2. Train Diffusion Model
+    if diffusion_A0_list:  # Only train if we have any data at all
+        gtd_framework = GTDFramework(
+            num_nodes=3,
+            node_feature_dim=384,
+            condition_dim=384,
+            gt_hidden_dim=64,
+            gt_num_layers=args.gt_num_layers,
+            gt_num_heads=args.gt_num_heads,
+            diffusion_num_timesteps=args.gtd_diffusion_steps,
+            device=device
+        )
+        
+        diffusion_dataset = TensorDataset(
+            torch.tensor(diffusion_A0_list, dtype=torch.float),
+            torch.tensor(diffusion_nodes_list, dtype=torch.float),
+            torch.tensor(diffusion_cond_list, dtype=torch.float)
+        )
+        diffusion_dataloader = DataLoader(diffusion_dataset, batch_size=16, shuffle=True)
+        
+        print("\n--- Training Diffusion Model with Partial Credit ---")
+        gtd_framework.train_diffusion_model(dataloader=diffusion_dataloader, epochs=args.gtd_epochs)
+    
+    torch.save(gtd_framework.diffusion_model.state_dict(), args.gtd_diffusion_model_path)
+    print(f"--- Saved trained Diffusion Model to {args.gtd_diffusion_model_path} ---")
+    print("--- Phase 2 Finished ---")
+
+async def run_gtd_experiment(args, dataset):
+    """PHASE 3: Run the GTD experiment with partial credit evaluation."""
+    print("--- Starting Phase 3: GTD Experiment with Partial Credit Evaluation ---")
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Load trained models
+    proxy_model = ProxyRewardModel(
+        input_dim=384,
+        gnn_hidden_dim=args.gnn_hidden_dim,
+        gnn_layers=args.gnn_layers,
+        mlp_hidden_dim=args.mlp_hidden_dim,
+        num_reward_components=2
+    )
+    proxy_model.load_state_dict(torch.load(args.gtd_proxy_model_path))
+    proxy_model.to(device)
+    proxy_model.eval()
+    
+    proxy_model.reward_component_names = ['utility', 'cost']
+    macp_weights = {'utility': 1.0, 'cost': -0.1}
+
+    gtd_framework = GTDFramework(
+        num_nodes=3,
+        node_feature_dim=384,
+        condition_dim=384,
+        gt_hidden_dim=64,
+        gt_num_layers=args.gt_num_layers,
+        gt_num_heads=args.gt_num_heads,
+        diffusion_num_timesteps=args.gtd_diffusion_steps,
+        proxy_reward_model=proxy_model,
+        macp_weights=macp_weights,
+        num_candidates_per_step=args.gtd_candidates,
+        device=device
+    )
+    gtd_framework.diffusion_model.load_state_dict(torch.load(args.gtd_diffusion_model_path))
+    gtd_framework.diffusion_model.to(device)
+    gtd_framework.diffusion_model.eval()
+    
+    # Run experiments
+    results = []
+    total_solved = 0.0  # Use float for partial credit
+    total_executed = 0
+    
+    for i, item in enumerate(dataset):
+        print(f"\nGTD Batch {i+1} {'-'*80}")
+        
+        task_prompt = item["task"]
+        test_code = item["test"]
+        
+        # Generate graph using GTD framework
+        condition = get_sentence_embedding(task_prompt)
+        generated_graph = gtd_framework.generate_graph(condition)
+        
+        # Convert to GDesigner format
+        topology_matrix = generated_graph.numpy()
+        agent_names = ['Project_Manager', 'Algorithm_Designer', 'Programming_Expert']
+        
+        # Run the graph
+        from GDesigner.graph.graph import Graph
+        gdesigner_graph = Graph(topology_matrix, agent_names)
+        
+        input_dict = {"task": task_prompt}
+        raw_answer, _ = await gdesigner_graph.arun(input_dict, args.num_rounds)
+        
+        predicted_code = humaneval_get_predict(raw_answer[0])
+        # Use partial credit scoring
+        score, result_str = check_correctness(task_prompt, predicted_code, test_code)
+        
+        total_solved += score  # Add the decimal score
+        total_executed += 1
+        
+        pass_rate = total_solved / total_executed
+        print(f"Query: {task_prompt[:50]}... | Score: {score:.3f} | Pass@1: {pass_rate:.3f}")
+        
+        results.append({
+            "problem_id": i,
+            "task": task_prompt,
+            "predicted_code": predicted_code,
+            "score": score,
+            "result_str": result_str,
+            "pass_rate": pass_rate
+        })
+    
+    # Save results
+    os.makedirs(os.path.dirname(args.output_file), exist_ok=True)
+    with open(args.output_file, 'w') as f:
+        json.dump(results, f, indent=2)
+    
+    final_pass_rate = total_solved / total_executed
+    print(f"\n--- Final Results ---")
+    print(f"Total Problems: {total_executed}")
+    print(f"Average Score (Partial Credit): {final_pass_rate:.3f}")
+    print(f"Results saved to: {args.output_file}")
+
+async def main():
+    args = parse_args()
+    
+    # Load dataset
+    with open('datasets/humaneval/humaneval-py.jsonl', 'r') as f:
+        dataset = [json.loads(line) for line in f]
+    
+    dataset = humaneval_data_process(dataset)
+    
+    if args.gtd_generate_data:
+        await generate_initial_dataset(args, dataset)
+    elif args.gtd_train_models:
+        await train_gtd_models(args)
+    else:
+        await run_gtd_experiment(args, dataset)
+
+if __name__ == "__main__":
+    asyncio.run(main())
