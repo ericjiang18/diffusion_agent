@@ -1,9 +1,11 @@
-from typing import Union, Dict, Any, List
+import yaml
+from typing import Dict, Any, Union, List
 import itertools
 
-from GDesigner.prompt.prompt_set import PromptSet
-from GDesigner.prompt.prompt_set_registry import PromptSetRegistry
-from GDesigner.prompt.common import get_combine_materials
+from .prompt_set import PromptSet
+from .prompt_set_registry import PromptSetRegistry
+from .common import get_combine_materials
+from ..utils.const import GDesigner_ROOT
 
 
 roles = itertools.cycle(['Knowlegable Expert',
@@ -132,10 +134,14 @@ class MMLUPromptSet(PromptSet):
         return ROLE_CONNECTION
     
     def get_description(self,role):
-        return ROLE_DESCRIPTION[role]
+        role_mapping = {
+            "Knowlegable_Expert": "Knowlegable Expert"
+        }
+        actual_role = role_mapping.get(role, role)
+        return ROLE_DESCRIPTION[actual_role]
     
     @staticmethod
-    def get_constraint():
+    def get_constraint(role=None):
         return """
             I will ask you a question.
             I will also give you 4 answers enumerated as A, B, C and D.
@@ -178,7 +184,7 @@ The first line of your reply must contain only one letter(for example : A, B, C 
         return NotImplementedError
 
     @staticmethod
-    def get_answer_prompt(question):
+    def get_answer_prompt(question, role=None):
         return f"""{question}"""
 
     @staticmethod

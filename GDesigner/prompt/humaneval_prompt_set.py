@@ -1,8 +1,8 @@
-from typing import Dict, Any
+from typing import Dict, Any, Union, List
 import itertools
-from GDesigner.prompt.prompt_set import PromptSet
-from GDesigner.prompt.prompt_set_registry import PromptSetRegistry
-from GDesigner.prompt.common import get_combine_materials
+from .prompt_set import PromptSet
+from .prompt_set_registry import PromptSetRegistry
+from .common import get_combine_materials
 
 roles = itertools.cycle(['Project Manager',
                          'Algorithm Designer',
@@ -17,16 +17,16 @@ ROLE_DESCRIPTION = {
         "You are responsible for overseeing the overall structure of the code, ensuring that the code is structured to complete the task Implement code concisely and correctly without pursuing over-engineering."
         "You need to suggest optimal design patterns to ensure that the code follows best practices for maintainability and flexibility. "
         "You can specify the overall design of the code, including the classes that need to be defined(maybe none) and the functions used (maybe only one function) ."
-        "I hope your reply will be more concise. Preferably within fifty words. Don’t list too many points.",
+        "I hope your reply will be more concise. Preferably within fifty words. Don't list too many points.",
     "Algorithm Designer":
-        "You are an algorithm designer. "
+        "You are an algorithm designer. CRITICAL: Generate ONLY executable Python code with proper syntax. Use def keyword, correct indentation, and valid Python. Do NOT generate pseudo-code or descriptions. NEVER write 'Define a function' or 'Implement a function' - just write the actual Python code. "
         "You will be given a function signature and its docstring by the user. "
         "You need to specify the specific design of the algorithm, including the classes that may be defined and the functions used. "
         "You need to generate the detailed documentation, including explanations of the algorithm, usage instructions, and API references. "
         "When the implementation logic is complex, you can give the pseudocode logic of the main algorithm."
-        "I hope your reply will be more concise. Preferably within fifty words. Don’t list too many points.",
+        "I hope your reply will be more concise. Preferably within fifty words. Don't list too many points.",
     "Programming Expert":
-        "You are a programming expert. "
+        "You are a programming expert. CRITICAL: Generate ONLY executable Python code with proper syntax. Use def keyword, correct indentation, and valid Python. Do NOT generate pseudo-code or descriptions. NEVER write 'Define a function' or 'Implement a function' - just write the actual Python code.  "
         "You will be given a function signature and its docstring by the user. "
         "You may be able to get the output results of other agents. They may have passed internal tests, but they may not be completely correct. "
         "Write your full implementation (restate the function signature). "
@@ -34,14 +34,14 @@ ROLE_DESCRIPTION = {
         "Do not include anything other than Python code blocks in your response. "
         "Do not change function names and input variable types in tasks.",
     "Test Analyst":
-        "You are a test analyst. "
+        "You are a test analyst. CRITICAL: Generate ONLY executable Python code with proper syntax. Use def keyword, correct indentation, and valid Python. Do NOT generate pseudo-code or descriptions. NEVER write 'Define a function' or 'Implement a function' - just write the actual Python code.  "
         "You will be given a function signature and its docstring by the user. "
         "You need to provide problems in the current code or solution based on the test data and possible test feedback in the question. "
         "You need to provide additional special use cases, boundary conditions, etc. that should be paid attention to when writing code. "
         "You can point out any potential errors in the code."
-        "I hope your reply will be more concise. Preferably within fifty words. Don’t list too many points.",
+        "I hope your reply will be more concise. Preferably within fifty words. Don't list too many points.",
     "Bug Fixer":
-        "You are a bug fixer."
+        "You are a bug fixer. CRITICAL: Generate ONLY executable Python code with proper syntax. Use def keyword, correct indentation, and valid Python. Do NOT generate pseudo-code or descriptions. NEVER write 'Define a function' or 'Implement a function' - just write the actual Python code. "
         "You will be given a function signature and its docstring by the user. "
         "You need to provide modified and improved python code based on the current overall code design, algorithm framework, code implementation or test problems. "
         "Write your full implementation (restate the function signature). "
@@ -73,9 +73,9 @@ ROLE_CONNECTION = [('Project Manager','Algorithm Designer'),
                    ('Bug Fixer','Programming Expert'),
                    ('Test Analyst','Programming Expert'),
                    ('Algorithm Designer','Test Analyst'),
-                   ('Project Manager','Promgramming Expert')]
+                   ('Project Manager','Programming Expert')]
 
-@PromptSetRegistry.register('humaneval')
+@PromptSetRegistry.register("humaneval")
 class HumanEvalPromptSet(PromptSet):
 
     @staticmethod
@@ -87,7 +87,18 @@ class HumanEvalPromptSet(PromptSet):
         return ROLE_DESCRIPTION[role]
 
     def get_description(self,role):
-        return ROLE_DESCRIPTION[role]
+        # Handle underscored role names for shell compatibility
+        role_mapping = {
+            "Project_Manager": "Project Manager",
+            "Algorithm_Designer": "Algorithm Designer", 
+            "Programming_Expert": "Programming Expert",
+            "Test_Analyst": "Test Analyst",
+            "Bug_Fixer": "Bug Fixer",
+            "Normal_Programmer": "Normal Programmer",
+            "Stupid_Programmer": "Stupid Programmer"
+        }
+        actual_role = role_mapping.get(role, role)
+        return ROLE_DESCRIPTION[actual_role]
     
     def get_role_connection(self):
         return ROLE_CONNECTION
@@ -97,7 +108,7 @@ class HumanEvalPromptSet(PromptSet):
         return "natural language"
 
     @staticmethod
-    def get_answer_prompt(question):
+    def get_answer_prompt(question, role=None):
         # Format the question for the AI assistant to answer
         return f"{question}"
 
@@ -248,7 +259,7 @@ f"## 💡 Candidate Answers for Evaluation:\n---\n{formatted_answers}\n---\n\n"
 "4. Ignore the candidate answers if they do not give a direct answer, for example, using 'unable to ...', 'as an AI ...'.\n"
 "5. Copy the chosen answer exactly as it is presented, maintaining its original format.\n"
 f"6. Adhere to the constraints: {constraint}.\n"
-"Note: If none of the answers fully meet the question's criteria, select the one closest to fulfilling them."
+"Note: If no answer fully meets the criteria, choose and copy the one that is closest to the requirements."
         )
 
     @staticmethod
@@ -257,20 +268,12 @@ f"6. Adhere to the constraints: {constraint}.\n"
 
     @staticmethod
     def get_decision_constraint():
-        return (
-"You will be given a function signature and its docstring by the user."
-"You may be given the overall code design, algorithm framework, code implementation or test problems."
-"Write your full implementation (restate the function signature). "
-"If the prompt given to you contains code that passed internal testing, you can choose the most reliable reply."
-"If there is no code that has passed internal testing in the prompt, you can change it yourself according to the prompt."
-"Use a Python code block to write your response. For example:\n```python\nprint('Hello world!')\n```"
-"Do not include anything other than Python code blocks in your response"
-)
-    
+        return "You need to give a plan to decide which agent to run next based on the historical information. You should give the name of the agent. You can also decide to terminate the process and give the final answer."
+
     @staticmethod
     def get_decision_role():
-        return "You are the top decision-maker and are good at analyzing and summarizing other people's opinions, finding errors and giving final answers. And you are an AI that only responds with only python code."
-    
+        return "You are a decision maker."
+
     @staticmethod
     def get_decision_few_shot():
         return ""
