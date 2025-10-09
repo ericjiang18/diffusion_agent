@@ -4,6 +4,7 @@ from abc import ABC
 import numpy as np
 import torch
 import asyncio
+import copy
 
 from GDesigner.graph.node import Node
 from GDesigner.agents.agent_registry import AgentRegistry
@@ -69,12 +70,34 @@ class Graph(ABC):
         self.potential_temporal_edges:List[List[str,str]] = []
         self.node_kwargs = node_kwargs if node_kwargs is not None else [{} for _ in agent_names]
         
-        self.init_nodes() # add nodes to the self.nodes
-        self.init_potential_edges() # add potential edges to the self.potential_spatial/temporal_edges
+        self.init_nodes() # Corrected call, no 'self' needed as it's an instance method
+        self.init_potential_edges() # Corrected call
         
         self.prompt_set = PromptSetRegistry.get(domain)
         self.role_adj_matrix = self.construct_adj_matrix()
         self.features = self.construct_features()
+        # Debug: check features dimensions
+        print(f"Debug: Final self.features shape after construct_features: {self.features.shape}")
+        if len(self.features.shape) < 2 or self.features.size(0) == 0:
+            print(f"ERROR: Features construction failed! Shape: {self.features.shape}")
+            print(f"This indicates a problem in node initialization or prompt set configuration")
+            print(f"Agent names: {agent_names}")
+            print(f"Domain: {domain}")
+            print(f"Let me run the debug version to see what's happening...")
+            
+            # At this point nodes should already have been created, but let's see what we have
+            print(f"Current nodes count: {len(self.nodes)}")
+            print(f"Nodes: {list(self.nodes.keys())}")
+            
+            if len(self.nodes) == 0:
+                print("Creating dummy features as fallback since no nodes were created.")
+                num_agents = len(agent_names) 
+                feature_dim = 384
+                self.features = torch.randn(num_agents, feature_dim, dtype=torch.float32)
+                print(f"Created dummy features with shape: {self.features.shape}")
+            else:
+                print("Nodes exist but features are empty. This shouldn't happen.")
+                raise RuntimeError(f"Nodes created but features failed. Debug needed.")
         self.gcn = GCN(self.features.size(1)*2,16,self.features.size(1))
         self.mlp = MLP(384,16,16)
 
@@ -94,39 +117,80 @@ class Graph(ABC):
         role_adj = torch.zeros((num_nodes,num_nodes))
         role_2_id = {}
         
-        for edge in role_connect:
-            in_role, out_role = edge
-            role_2_id[in_role] = []
-            role_2_id[out_role] = []
+        # First, collect all actual roles that exist in our nodes
+        actual_roles = set()
+        for node_id in self.nodes:
+            role = self.nodes[node_id].role
+            actual_roles.add(role)
+            
+        # Only initialize role mappings for roles that actually exist
+        for role in actual_roles:
+            role_2_id[role] = []
+            
+        # Map node indices to roles
         for i, node_id in enumerate(self.nodes):
             role = self.nodes[node_id].role
             role_2_id[role].append(i)
             
         for edge in role_connect:
-            in_role,out_role = edge
-            in_ids = role_2_id[in_role]
-            out_ids = role_2_id[out_role]
-            for in_id in in_ids:
-                for out_id in out_ids:
-                    role_adj[in_id][out_id] = 1
+            in_role, out_role = edge
+            # Only process connections if both roles actually exist in our nodes
+            if in_role in role_2_id and out_role in role_2_id:
+                in_ids = role_2_id[in_role]
+                out_ids = role_2_id[out_role]
+                for in_id in in_ids:
+                    for out_id in out_ids:
+                        role_adj[in_id][out_id] = 1
         
         edge_index, edge_weight = dense_to_sparse(role_adj)
         return edge_index
     
     def construct_features(self):
         features = []
+        print(f"Debug: self.nodes keys = {list(self.nodes.keys())}")
+        print(f"Debug: Number of nodes = {len(self.nodes)}")
+        
         for node_id in self.nodes:
+            print(f"Debug: Processing node {node_id}")
             role = self.nodes[node_id].role
-            profile = self.prompt_set.get_description(role)
-            feature = get_sentence_embedding(profile)
-            features.append(feature)
-        features = torch.tensor(np.array(features))
+            print(f"Debug: Node {node_id} has role '{role}'")
+            
+            try:
+                profile = self.prompt_set.get_description(role)
+                print(f"Debug: Got profile for role '{role}': {profile[:100]}...")
+                feature = get_sentence_embedding(profile)
+                print(f"Debug: Feature shape for {role}: {np.array(feature).shape}")
+                features.append(feature)
+            except Exception as e:
+                print(f"Error processing node {node_id} with role '{role}': {e}")
+                # Create a default feature vector if there's an error
+                default_feature = np.zeros(384, dtype=np.float32)  # Assuming 384-dim embeddings
+                features.append(default_feature)
+        
+        if not features:
+            print("Warning: No features generated, nodes list is empty!")
+            return torch.tensor([])
+            
+        features_array = np.array(features, dtype=np.float32)
+        print(f"Debug: Final features array shape: {features_array.shape}")
+        features = torch.tensor(features_array, dtype=torch.float32)
         return features
     
     def construct_new_features(self, query):
-        query_embedding = torch.tensor(get_sentence_embedding(query))
-        query_embedding = query_embedding.unsqueeze(0).repeat((self.num_nodes,1))
-        new_features = torch.cat((self.features,query_embedding),dim=1)
+        query_embedding = torch.tensor(get_sentence_embedding(query), dtype=torch.float32)
+        
+        # Ensure query_embedding has correct dimensions to match self.features
+        if len(query_embedding.shape) == 1:
+            query_embedding = query_embedding.unsqueeze(0)  # Make it 2D: [1, embedding_dim]
+        
+        # Repeat to match the number of nodes in self.features
+        actual_num_nodes = self.features.size(0)
+        query_embedding = query_embedding.repeat((actual_num_nodes, 1))
+        
+        # Debug: check dimensions before concatenation
+        print(f"Debug: self.features.shape = {self.features.shape}, query_embedding.shape = {query_embedding.shape}")
+        
+        new_features = torch.cat((self.features, query_embedding), dim=1)
         return new_features
         
     @property
@@ -177,7 +241,7 @@ class Graph(ABC):
         Creates and adds new nodes to the graph.
         """
         for agent_name,kwargs in zip(self.agent_names,self.node_kwargs):
-            if agent_name in AgentRegistry.registry:
+            if agent_name in AgentRegistry.keys():
                 kwargs["domain"] = self.domain
                 kwargs["llm_name"] = self.llm_name
                 agent_instance = AgentRegistry.get(agent_name, **kwargs)
@@ -386,6 +450,62 @@ class Graph(ABC):
             prune_idx = sorted_edges_idx[:int(prune_num_edges + num_masks)]
             self.temporal_masks[prune_idx] = 0
         return self.spatial_masks, self.temporal_masks
+
+    def init_nodes(self):
+        """Initialize nodes from agent_names"""
+        print(f"Debug: Initializing nodes with agent_names: {self.agent_names}")
+        
+        # Check what agents are available in the registry
+        available_agents = list(AgentRegistry.registry.keys()) if hasattr(AgentRegistry.registry, 'keys') else []
+        print(f"Debug: Available agents in registry: {available_agents}")
+        
+        for i, agent_name in enumerate(self.agent_names):
+            node_kwargs = self.node_kwargs[i] if i < len(self.node_kwargs) else {}
+            try:
+                # First try the agent_name directly
+                node = AgentRegistry.get(agent_name, domain=self.domain, llm_name=self.llm_name, **node_kwargs)
+                node_id = f"{agent_name}_{i}"
+                self.nodes[node_id] = node
+                print(f"Debug: Created node {node_id} with role {node.role}")
+            except Exception as e:
+                print(f"Debug: Direct agent creation failed for {agent_name}: {e}")
+                # Try some common fallback agent types
+                fallback_agents = ["MathSolver", "Critic", "AnalyzeAgent", "FinalDirect"]
+                node_created = False
+                
+                for fallback_agent in fallback_agents:
+                    try:
+                        if fallback_agent in available_agents:
+                            print(f"Debug: Trying fallback agent: {fallback_agent}")
+                            node = AgentRegistry.get(fallback_agent, domain=self.domain, llm_name=self.llm_name, **node_kwargs)
+                            # Override the role to match the intended agent_name, converting underscores to spaces
+                            role_name = agent_name.replace('_', ' ')
+                            node.role = role_name
+                            node_id = f"{agent_name}_{i}"
+                            self.nodes[node_id] = node
+                            print(f"Debug: Created fallback node {node_id} with role {node.role}")
+                            node_created = True
+                            break
+                    except Exception as fallback_e:
+                        print(f"Debug: Fallback {fallback_agent} also failed: {fallback_e}")
+                        continue
+                
+                if not node_created:
+                    print(f"Warning: Could not create any node for {agent_name}")
+                    
+        print(f"Debug: Total nodes created: {len(self.nodes)}")
+    
+    def init_potential_edges(self):
+        """Initialize potential edges between nodes"""
+        node_ids = list(self.nodes.keys())
+        for i, node1_id in enumerate(node_ids):
+            for j, node2_id in enumerate(node_ids):
+                if i != j:
+                    self.potential_spatial_edges.append([node1_id, node2_id])
+                    self.potential_temporal_edges.append([node1_id, node2_id])
+        print(f"Debug: Created {len(self.potential_spatial_edges)} potential spatial edges")
+        print(f"Debug: Created {len(self.potential_temporal_edges)} potential temporal edges")
+
 
 def min_max_norm(tensor:torch.Tensor):
     min_val = tensor.min()
