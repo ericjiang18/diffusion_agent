@@ -12,7 +12,7 @@ AGENT_NUMS="1 1 1 1" # Corresponds to the number of agents for each name
 BATCH_SIZE=2
 OUTPUT_DIR="trained_models" # All outputs will go here
 
-# IMPORTANT: Separate training and testing datasets to avoid data leakage
+# Separate training and testing datasets to avoid data leakage
 TRAIN_DATASET_JSON="datasets/humaneval/humaneval-train.jsonl"  # For Phase 1: data generation
 TEST_DATASET_JSON="datasets/humaneval/humaneval-test.jsonl"    # For Phase 3: evaluation
 
