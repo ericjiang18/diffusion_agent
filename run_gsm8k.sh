@@ -10,7 +10,7 @@ AGENT_NAMES="MathSolver"
 AGENT_NUMS=4
 BATCH_SIZE=2
 
-# IMPORTANT: Separate training and testing datasets to avoid data leakage
+# Separate training and testing datasets to avoid data leakage
 TRAIN_DATASET_JSON="datasets/gsm8k/gsm8k_train.jsonl"  # For Phase 1: data generation
 TEST_DATASET_JSON="datasets/gsm8k/gsm8k_test.jsonl"    # For Phase 3: evaluation
 
